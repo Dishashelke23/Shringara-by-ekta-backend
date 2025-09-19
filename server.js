@@ -3,6 +3,7 @@ const mongoose = require("mongoose");
 const Razorpay = require("razorpay");
 const crypto = require("crypto");
 const { OAuth2Client } = require("google-auth-library");
+const jwt = require("jsonwebtoken");
 require("dotenv").config();
 
 const app = express();
@@ -27,7 +28,9 @@ app.use((req, res, next) => {
   res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
   res.header("Access-Control-Allow-Headers", "Content-Type, Authorization, Accept");
 
-  if (req.method === "OPTIONS") return res.status(200).end();
+  if (req.method === "OPTIONS") {
+    return res.status(200).end();
+  }
 
   next();
 });
@@ -43,6 +46,20 @@ mongoose
   .catch(err => console.error("❌ MongoDB connection error:", err));
 
 // --------------------
+// ✅ User Schema
+// --------------------
+const userSchema = new mongoose.Schema({
+  googleId: { type: String, required: true, unique: true },
+  email: { type: String, required: true, unique: true },
+  name: String,
+  picture: String,
+  createdAt: { type: Date, default: Date.now },
+  lastLogin: Date
+});
+
+const User = mongoose.model("User", userSchema);
+
+// --------------------
 // ✅ Order Schema
 // --------------------
 const orderSchema = new mongoose.Schema({
@@ -52,12 +69,46 @@ const orderSchema = new mongoose.Schema({
   currency: String,
   products: Array,
   customer: Object,
+  userId: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
   status: { type: String, default: "Pending" },
   createdAt: { type: Date, default: Date.now },
   updatedAt: { type: Date }
 });
 
 const Order = mongoose.model("Order", orderSchema);
+
+// --------------------
+// ✅ JWT Setup - FIXED: Consistent secret usage
+// --------------------
+const JWT_SECRET = process.env.JWT_SECRET || "your-jwt-secret-key";
+
+const generateToken = (user) => {
+  return jwt.sign(
+    { userId: user._id, email: user.email },
+    JWT_SECRET,
+    { expiresIn: "7d" }
+  );
+};
+
+// --------------------
+// ✅ Middleware to verify JWT - FIXED: Consistent secret usage
+// --------------------
+const authenticateToken = (req, res, next) => {
+  const authHeader = req.headers["authorization"];
+  const token = authHeader && authHeader.split(" ")[1]; // Bearer TOKEN
+
+  if (!token) {
+    return res.status(401).json({ success: false, message: "Access token required" });
+  }
+
+  jwt.verify(token, JWT_SECRET, (err, user) => {
+    if (err) {
+      return res.status(403).json({ success: false, message: "Invalid or expired token" });
+    }
+    req.user = user;
+    next();
+  });
+};
 
 // --------------------
 // ✅ Razorpay Instance
@@ -76,7 +127,7 @@ razorpay.orders.all({ count: 1 }, (err) => {
 // --------------------
 // 🔹 Create Order
 // --------------------
-app.post("/create-order", async (req, res) => {
+app.post("/create-order", authenticateToken, async (req, res) => {
   try {
     const { amount, currency, products, customer } = req.body;
     if (!amount || !products || !customer) return res.status(400).json({ error: "Missing required fields" });
@@ -94,6 +145,7 @@ app.post("/create-order", async (req, res) => {
       currency: order.currency,
       products,
       customer,
+      userId: req.user.userId,
       status: "Created"
     });
     await newOrder.save();
@@ -148,22 +200,83 @@ app.get("/config/google", (req, res) => {
 app.post("/auth/google", async (req, res) => {
   try {
     const { token } = req.body;
-    const ticket = await googleClient.verifyIdToken({ idToken: token, audience: process.env.GOOGLE_CLIENT_ID });
+    const ticket = await googleClient.verifyIdToken({ 
+      idToken: token, 
+      audience: process.env.GOOGLE_CLIENT_ID 
+    });
     const payload = ticket.getPayload();
+
+    // Find or create user
+    let user = await User.findOne({ googleId: payload.sub });
+    
+    if (!user) {
+      user = new User({
+        googleId: payload.sub,
+        email: payload.email,
+        name: payload.name,
+        picture: payload.picture,
+        lastLogin: new Date()
+      });
+    } else {
+      user.lastLogin = new Date();
+    }
+    
+    await user.save();
+
+    // Generate JWT token
+    const jwtToken = generateToken(user);
 
     res.json({
       success: true,
-      token: "google-token-" + Date.now(), // optional token for localStorage
+      token: jwtToken,
       user: {
-        id: payload.sub,
-        name: payload.name,
-        email: payload.email,
-        picture: payload.picture
+        id: user._id,
+        name: user.name,
+        email: user.email,
+        picture: user.picture
       }
     });
   } catch (err) {
     console.error("❌ Google Auth error:", err);
     res.status(401).json({ success: false, message: "Invalid token" });
+  }
+});
+
+// --------------------
+// 🔹 Protected Route - User Orders
+// --------------------
+app.get("/api/user/orders", authenticateToken, async (req, res) => {
+  try {
+    const orders = await Order.find({ userId: req.user.userId }).sort({ createdAt: -1 });
+    res.json({ success: true, orders });
+  } catch (err) {
+    console.error("❌ Error fetching orders:", err);
+    res.status(500).json({ success: false, message: "Error fetching orders" });
+  }
+});
+
+// --------------------
+// 🔹 Check Authentication Status
+// --------------------
+app.get("/api/auth/check", authenticateToken, async (req, res) => {
+  try {
+    const user = await User.findById(req.user.userId);
+    if (!user) {
+      return res.status(404).json({ success: false, message: "User not found" });
+    }
+    
+    res.json({
+      success: true,
+      user: {
+        id: user._id,
+        name: user.name,
+        email: user.email,
+        picture: user.picture
+      }
+    });
+  } catch (err) {
+    console.error("❌ Auth check error:", err);
+    res.status(500).json({ success: false, message: "Error checking authentication" });
   }
 });
 
